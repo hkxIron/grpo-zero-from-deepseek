@@ -43,8 +43,8 @@ formatter = logging.Formatter("[%(levelname)s|%(filename)s:%(lineno)s] %(message
 ch.setFormatter(formatter)
 logger.addHandler(ch)
 
-arg_parser = argparse.ArgumentParser(description="Train R1 model with PPO")
-arg_parser.add_argument("--kl_coeff", type=float, default=0.001, help="KL coefficient for PPO")
+arg_parser = argparse.ArgumentParser(description="Train R1 model with grpo")
+arg_parser.add_argument("--kl_coeff", type=float, default=0.001, help="KL coefficient for grpo")
 arg_parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for sampling")
 arg_parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-3B", help="Model name/path")
 arg_parser.add_argument("--per_device_batch_size", type=int, default=8, help="Per device batch size")
@@ -55,6 +55,7 @@ arg_parser.add_argument("--algorithm", type=str, choices=["grpo", "vineppo"], de
 arg_parser.add_argument("--vineppo_k", type=int, default=3, help="Number of MC samples to take for each response")
 arg_parser.add_argument("--run_id", type=str, default=None, help="Run ID")
 arg_parser.add_argument("--nproc", type=int, default=1, help="Number of processes (data parallelism) to use")
+arg_parser.add_argument("--data_path", type=str, default="Jiayi-Pan/Countdown-Tasks-3to4", help="数据集路径")
 
 
 # Load and process dataset
@@ -671,7 +672,7 @@ def main(rank: int):
     NUM_ITERATIONS = 1000
     # Number of episodes to collect per iteration for training
     EPISODES_PER_ITERATION = 64
-    EPISODES_PER_ITERATION_PER_RANK = EPISODES_PER_ITERATION // dist.get_world_size()
+    EPISODES_PER_ITERATION_PER_RANK = EPISODES_PER_ITERATION // dist.get_world_size() # 每个gpu上跑的episode数量
     # Number of responses to generate for each input prompt
     GENERATIONS_PER_SAMPLE = 4
     # Controls how much the policy can deviate from the reference model
@@ -692,15 +693,15 @@ def main(rank: int):
     TOP_P = 0.999  # to avoid sampling unused tokens absent from tokenizer see https://github.com/vllm-project/vllm/issues/13175#issuecomment-2781842571
     # Top-k sampling parameter (-1 = disabled)
     TOP_K = -1  # no top k
-    # Number of MC samples to take for each response
+    # Number of MC samples(蒙特卡罗采样) to take for each response
     VINEPPO_K = args.vineppo_k
     # DeepSpeed configuration
     deepspeed_config = {
         "bf16": {"enabled": True},
         "zero_optimization": {"stage": 2, "overlap_comm": False},
-        "train_batch_size": EPISODES_PER_ITERATION,
-        "train_micro_batch_size_per_gpu": PER_DEVICE_BATCH_SIZE,
-        "gradient_accumulation_steps": EPISODES_PER_ITERATION_PER_RANK // PER_DEVICE_BATCH_SIZE,
+        "train_batch_size": EPISODES_PER_ITERATION, # 64
+        "train_micro_batch_size_per_gpu": PER_DEVICE_BATCH_SIZE, # 8
+        "gradient_accumulation_steps": EPISODES_PER_ITERATION_PER_RANK // PER_DEVICE_BATCH_SIZE, # 样度累加 = 64/num_gpu / 8
         "gradient_clipping": 1.0,
         "optimizer": {
             "type": "AdamW",
@@ -716,12 +717,12 @@ def main(rank: int):
     }
     ref_deepspeed_config = {
         "bf16": {"enabled": True},
-        # No effect
+        # No effect, only fill for deepspeed config param
         "train_batch_size": EPISODES_PER_ITERATION,
         "train_micro_batch_size_per_gpu": PER_DEVICE_BATCH_SIZE,
         "gradient_accumulation_steps": EPISODES_PER_ITERATION_PER_RANK // PER_DEVICE_BATCH_SIZE,
     }
-
+    # Synchronize all processes.
     dist.barrier(device_ids=[torch.cuda.current_device()])
 
     model_name_short = MODEL_NAME.split("/")[-1]
@@ -753,11 +754,12 @@ def main(rank: int):
     EOS_TOKEN_ID = tokenizer.eos_token_id
     EOS_TOKEN = tokenizer.convert_ids_to_tokens(EOS_TOKEN_ID)
 
-    dataset = load_dataset("Jiayi-Pan/Countdown-Tasks-3to4", split="train")
+    dataset = load_dataset(args.data_path, split="train")
     # Rank 0 will preprocess the dataset first
     if dist.get_rank() != 0:
         # Other ranks will wait for rank 0 to enter the barrier
-        dist.barrier(device_ids=[torch.cuda.current_device()])
+        dist.barrier(device_ids=[torch.cuda.current_device()]) # 不是rank=0的进程，会在这里等待rank=0的进程进入barrier
+
     dataset = dataset.map(
         preprocess_example,
         num_proc=6,
@@ -934,7 +936,7 @@ def main(rank: int):
 
         gen_time = time.time()
 
-        # Sample responses
+        # Rollout: Sample responses
         outputs = inference_engine.generate(
             prompt_token_ids=samples["input_ids"],
             sampling_params=SamplingParams(
@@ -1039,7 +1041,7 @@ def main(rank: int):
 
         # Free memory taken by reference model
         logger.info("Moving reference model back to CPU")
-        reference_model.cpu()
+        reference_model.cpu() # 将model 移到cpu
         gc.collect()
         torch.cuda.empty_cache()
         time.sleep(1)
@@ -1094,7 +1096,7 @@ def main(rank: int):
         time.sleep(1)
 
         inference_engine.wake_up()
-        load_model_into_vllm(policy_model, inference_engine)
+        load_model_into_vllm(policy_model, inference_engine) # 更新vllm中的模型权重
 
         #########################################################
         # Log metrics
@@ -1146,6 +1148,7 @@ def main(rank: int):
             dist.barrier(device_ids=[torch.cuda.current_device()])
 
     dist.destroy_process_group()
+    print(f"rank={rank} Training complete!")
 
 
 if __name__ == "__main__":
@@ -1159,3 +1162,10 @@ if __name__ == "__main__":
         main(rank=0)
     else:
         torch.multiprocessing.spawn(main, nprocs=args.nproc)
+
+"""
+## Multi-GPU Training
+Here is the command to run the training script with 4 GPUs:
+
+python nano_r1_script.py --nproc 4  # Use 4 GPUs
+"""

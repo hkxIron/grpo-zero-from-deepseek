@@ -370,7 +370,7 @@ def find_last_checkpoint(exp_dir: Path) -> Tuple[Optional[Path], Optional[int]]:
     return ckpt_path, ckpt_iter
 
 
-def load_model_into_vllm(model: Union[DeepSpeedEngine, PreTrainedModel], llm: LLM) -> None:
+def load_model_into_vllm(model: Union[DeepSpeedEngine, PreTrainedModel], vllm_engine: LLM) -> None:
     """
     Load weights from a HuggingFace model (either wrapped in DeepSpeed or not) into a vLLM inference engine.
 
@@ -387,7 +387,7 @@ def load_model_into_vllm(model: Union[DeepSpeedEngine, PreTrainedModel], llm: LL
         None
     """
     state_dict = model.module.state_dict() if isinstance(model, DeepSpeedEngine) else model.state_dict()
-    llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights(state_dict.items())
+    vllm_engine.llm_engine.model_executor.driver_worker.model_runner.model.load_weights(state_dict.items())
 
 
 def initialize_training_process_group(rank: int, world_size: int):

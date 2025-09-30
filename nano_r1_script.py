@@ -64,16 +64,13 @@ def preprocess_example(
     tokenizer: AutoTokenizer,
     SYSTEM_MESSAGE: str,
     PROMPT_TEMPLATE: str,
-):
+)-> Dict[str, Any]:
     numbers: List[int] = example["nums"]
     target: int = example["target"]
 
     prefix = [
         {"role": "system", "content": SYSTEM_MESSAGE},
-        {
-            "role": "user",
-            "content": PROMPT_TEMPLATE.format(numbers=numbers, target=target),
-        },
+        {"role": "user", "content": PROMPT_TEMPLATE.format(numbers=numbers, target=target)},
         {"role": "assistant", "content": "Let me solve this step by step.\n<think>"},
     ]
     input_ids = tokenizer.apply_chat_template(prefix, tokenize=True, continue_final_message=True)
@@ -184,6 +181,7 @@ def compute_reward(completion: str, sample: Dict[str, Any], EOS_TOKEN: str) -> T
     format_reward = format_reward_func(completion, EOS_TOKEN)
     equation_reward = equation_reward_func(completion=completion, nums=nums, target=target)
 
+    # 格式reward + 结果reward
     reward = format_reward + equation_reward
 
     metrics = {
@@ -240,7 +238,7 @@ def create_training_episodes(
         {
             'all_query_token_ids': [[1,2,3], [1,2,3], [1,2,3]],
             'all_response_token_ids': [[4,5,EOS], [6,7], [8,9,EOS]],
-            'all_advantages': [[0.5,0.5,0.5], [-1.0,-1.0], [0.5,0.5,0.5]]
+            'all_advantages': [[0.5,0.5,0.5], [-1.0,-1.0], [0.5,0.5,0.5]] , # 注意，同一个generation的所有的token的advantage是一样的
         }
     """
     assert len(all_generations) == len(all_finish_reasons)
@@ -269,6 +267,7 @@ def create_training_episodes(
         rewards = np.array(rewards)
         advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
 
+        # per_token_advantages = [resp_length], 注意：此处是每一token都复制了一个advantage, 但感觉不是非常必要
         per_token_advantages = [[adv] * len(resp) for adv, resp in zip(advantages, response_token_ids)]
 
         all_query_token_ids.extend([sample["input_ids"]] * GENERATIONS_PER_SAMPLE)
@@ -612,18 +611,37 @@ def compute_pg_loss(
         "labels_mask": labels_mask,
     }
 
-    logps = compute_token_log_probs(policy_model, model_inputs, TEMPERATURE)  # [batch_size, seq_len-1]
-    labels_mask = labels_mask[..., 1:].to(logps.dtype)  # [batch_size, seq_len-1]
+    logps_per_token = compute_token_log_probs(policy_model, model_inputs, TEMPERATURE)  # [batch_size, seq_len-1]
+    labels_mask = labels_mask[..., 1:].to(logps_per_token.dtype)  # [batch_size, seq_len-1]
 
-    ref_logratio = ref_logps - logps
-    kl_penalty = torch.exp(ref_logratio) - 1 - ref_logratio  # [batch_size, seq_len-1]
+    """
+    kl_div(p, q) = p*log(p/q) = plog(p) - plog(q)
+    = (-plog(q)) - (- plog(p))
+    = ross_entropy(p, q) - entropy(p)
+    =>
+    实际如下计算，但我并不清楚其中原理
+    kl_div(p, q) = q/p - log(q) - 1
+    
+    # openai lm_human_preferences中的kl实现：https://github.com/openai/lm-human-preferences/blob/cbfd210bb8b08f6bc5c26878c10984b90f516c66/lm_human_preferences/train_policy.py#L150-L153 
+    def compute_rewards(scores, logprobs, ref_logprobs):
+        kl = logprobs - ref_logprobs # 就是标准的 p*log(p/q)
+        non_score_reward = -self.kl_ctl.value * kl
+        rewards = non_score_reward.copy()
+        rewards[:, -1] += scores
+        return rewards, non_score_reward, self.kl_ctl.value
+    """
+    # ref_logprobs，只为了计算kl散度
+    ref_logratio = ref_logps - logps_per_token
+    kl_penalty = torch.exp(ref_logratio) - 1 - ref_logratio  # [batch_size, seq_len-1], NOTE: 这里为何要多减一个ref_logratio,感觉没有必要吧？
     kl_penalty = kl_penalty * labels_mask  # [batch_size, seq_len-1]
 
     with torch.no_grad():
-        entropy = -logps.sum() / labels_mask.sum()  # scalar
+        # logps_per_token: [batch_size, seq_len-1]
+        entropy = -logps_per_token.sum() / labels_mask.sum()  # scalar,这个batch中所有的token概率求和, NOTE:感觉是少乘了p吧 ，熵应该是 -p*log(p)
         zero_advantages = close_to_zero(advantages, labels_mask)  # scalar
 
-    policy_loss = -logps * advantages[..., 1:]  # [batch_size, seq_len-1]
+    # advantage为loss的权重，最后的loss为加权loss
+    policy_loss = -logps_per_token * advantages[..., 1:]  # [batch_size, seq_len-1]
     policy_loss = policy_loss * labels_mask  # [batch_size, seq_len-1]
 
     loss = (policy_loss + KL_COEFFICIENT * kl_penalty).sum() / total_response_len  # scalar
@@ -634,7 +652,6 @@ def compute_pg_loss(
         "entropy": entropy.item() / total_response_len.item(),
         "zero_advantages_ratio": zero_advantages.item() / total_response_len.item(),
     }
-
     return loss, metrics
 
 
@@ -698,10 +715,10 @@ def main(rank: int):
     # DeepSpeed configuration
     deepspeed_config = {
         "bf16": {"enabled": True},
-        "zero_optimization": {"stage": 2, "overlap_comm": False},
+        "zero_optimization": {"stage": 2, "overlap_comm": False}, # os + g分片, 但没有p分片
         "train_batch_size": EPISODES_PER_ITERATION, # 64
         "train_micro_batch_size_per_gpu": PER_DEVICE_BATCH_SIZE, # 8
-        "gradient_accumulation_steps": EPISODES_PER_ITERATION_PER_RANK // PER_DEVICE_BATCH_SIZE, # 样度累加 = 64/num_gpu / 8
+        "gradient_accumulation_steps": EPISODES_PER_ITERATION_PER_RANK // PER_DEVICE_BATCH_SIZE, # 样度累加 = batch=64/num_gpu=8/ micro_batch_size_per_gpu=8
         "gradient_clipping": 1.0,
         "optimizer": {
             "type": "AdamW",
@@ -717,10 +734,10 @@ def main(rank: int):
     }
     ref_deepspeed_config = {
         "bf16": {"enabled": True},
-        # No effect, only fill for deepspeed config param
-        "train_batch_size": EPISODES_PER_ITERATION,
-        "train_micro_batch_size_per_gpu": PER_DEVICE_BATCH_SIZE,
-        "gradient_accumulation_steps": EPISODES_PER_ITERATION_PER_RANK // PER_DEVICE_BATCH_SIZE,
+        # NOTE: No effect, only fill for deepspeed config param, 此处并没有什么作用
+        "train_batch_size": EPISODES_PER_ITERATION, # 64
+        "train_micro_batch_size_per_gpu": PER_DEVICE_BATCH_SIZE, # 8
+        "gradient_accumulation_steps": EPISODES_PER_ITERATION_PER_RANK // PER_DEVICE_BATCH_SIZE, # 64 // 8
     }
     # Synchronize all processes.
     dist.barrier(device_ids=[torch.cuda.current_device()])
@@ -730,10 +747,10 @@ def main(rank: int):
         RUN_NAME = f"{model_name_short}_temp{TEMPERATURE}_kl{KL_COEFFICIENT}_lr{LEARNING_RATE}_al{args.algorithm}"
     else:
         RUN_NAME = args.run_id
-    EXP_DIR = Path.home() / "scratch" / "nano_aha_moment" / RUN_NAME
+    EXP_DIR = Path.home() / "scratch" / "grpo_zero_from_deepseek" / RUN_NAME
     EXP_DIR.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Logs and Checkpoints will be saved to: {EXP_DIR}")
+    logger.info(f"exp:{RUN_NAME} Logs and Checkpoints will be saved to: {EXP_DIR}")
 
     ############################################
     # Prompts and Dataset
@@ -755,11 +772,19 @@ def main(rank: int):
     EOS_TOKEN = tokenizer.convert_ids_to_tokens(EOS_TOKEN_ID)
 
     dataset = load_dataset(args.data_path, split="train")
+    # 下面的代码可能存在死锁，暂时屏蔽
     # Rank 0 will preprocess the dataset first
-    if dist.get_rank() != 0:
-        # Other ranks will wait for rank 0 to enter the barrier
-        dist.barrier(device_ids=[torch.cuda.current_device()]) # 不是rank=0的进程，会在这里等待rank=0的进程进入barrier
+    # if dist.get_rank() != 0:
+    #     # Other ranks will wait for rank 0 to enter the barrier
+    #     dist.barrier(device_ids=[torch.cuda.current_device()]) # 不是rank=0的进程，会在这里等待rank=0的进程进入barrier
 
+    # 改为所有进程在此等待，确保数据集加载完成, dist.barrier() 是一个集体通信操作，要求 所有参与进程都必须进入 barrier，否则会无限等待（死锁）。
+    #dist.barrier(device_ids=[torch.cuda.current_device()])
+    dist.barrier()
+
+    # 只有rank=0进进行预处理
+    # 所有进程并行预处理
+    #if dist.get_rank() == 0:
     dataset = dataset.map(
         preprocess_example,
         num_proc=6,
@@ -768,20 +793,22 @@ def main(rank: int):
             "SYSTEM_MESSAGE": SYSTEM_MESSAGE,
             "PROMPT_TEMPLATE": PROMPT_TEMPLATE,
         },
-        desc="Preprocessing dataset",
+        desc=f"Preprocessing dataset, rank:{dist.get_rank()}",
     )
-    if dist.get_rank() == 0:
-        # Rank 0 will enter the barrier so that other ranks can start preprocessing
-        dist.barrier(device_ids=[torch.cuda.current_device()])
-    dist.barrier(device_ids=[torch.cuda.current_device()])
 
+    # 所有进程等待 Rank 0 完成预处理
+    #dist.barrier(device_ids=[torch.cuda.current_device()])
+    dist.barrier()
+
+    # NOTE:如果是多机训练，需要广播预处理后的数据集
+    # 这里假设是单机多GPU，数据集已经在内存中共享
     # Split dataset
     train_test_split = dataset.train_test_split(test_size=500, seed=42)
     train_dataset = train_test_split["train"]
     orig_train_dataset_size = len(train_dataset)
     test_dataset = train_test_split["test"]
 
-    # Shard the training dataset
+    # Shard the training dataset, 按照gpu数量分片
     train_dataset = train_dataset.shard(num_shards=dist.get_world_size(), index=dist.get_rank())
 
     logger.info(f"Train dataset size: {orig_train_dataset_size}; each rank will process {len(train_dataset)} samples")
@@ -805,10 +832,43 @@ def main(rank: int):
     )
     policy_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
+    """
+    梯度检查点 是一种用计算时间换取显存空间的技术，它通过在前向传播中只保存部分激活值，在反向传播时重新计算其他激活值来减少显存使用。
+    use_reentrant=True（默认值，传统方式）
+    特点：
+        使用可重入的自动梯度实现
+        兼容性更好，但功能有限
+        不支持：torch.autograd.grad()
+        不支持：关键字参数传递
+        实现相对简单
+    但现在一般推荐使用 use_reentrant=False
+    
+    # 示例1：支持 torch.autograd.grad()
+    def compute_gradients_with_grad(model, inputs):
+        outputs = model(inputs)
+        loss = outputs.sum()
+        
+        # 这种用法在 use_reentrant=False 时才能正常工作
+        gradients = torch.autograd.grad(loss, model.parameters())
+        return gradients
+
+    # 示例2：支持关键字参数
+    class CustomModel(nn.Module):
+        def forward(self, x, attention_mask=None, labels=None):
+            # 使用关键字参数
+            if attention_mask is not None:
+                x = x * attention_mask
+            return x
+
+    # 梯度检查点可以正确处理关键字参数
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    output = model(input_ids, attention_mask=attention_mask)  # 正常工作
+    """
+
     see_memory_usage("Before initializing DeepSpeed engines", force=dist.get_rank() == 0)
 
     # Initialize DeepSpeed engines
-    policy_model, *_ = deepspeed.initialize(
+    policy_model, *_ = deepspeed.initialize( #  <class 'deepspeed.DeepSpeedEngine'>
         model=policy_model,
         config=deepspeed_config,
         model_parameters=policy_model.parameters(),
@@ -817,22 +877,74 @@ def main(rank: int):
         model=reference_model,
         config=ref_deepspeed_config,
     )
-
+    # NOTE: 将ref模型从 GPU 移动到 CPU 内存中,因为ref_model 不参与梯度更新，可以放在CPU上节省显存
     reference_model.module.cpu()
-    dist.barrier(device_ids=[torch.cuda.current_device()])
+
+    """
+    等价于
+    # 获取原始模型
+    original_model = reference_model.module
+    # 将原始模型移动到CPU
+    original_model = original_model.cpu()
+    
+    使用场景：在强化学习中，reference_model 通常用于计算基线或参考值
+    # 但不参与梯度更新，可以放在CPU上节省显存
+    # policy_model -> GPU (需要训练，频繁使用)
+    # reference_model -> CPU (仅用于参考，不训练)
+   
+    示例代码： 
+    def training_step(policy_model, reference_model, batch):
+        # policy_model 在 GPU 上，用于训练
+        policy_outputs = policy_model(**batch)
+        policy_loss = policy_outputs.loss
+        
+        # reference_model 在 CPU 上，用于计算基线
+        with torch.no_grad():
+            # 临时将 reference_model 移到 GPU 进行计算
+            reference_model.module.cuda()
+            reference_outputs = reference_model.module(**batch)
+            reference_model.module.cpu()  # 计算完立即移回CPU
+            baseline = reference_outputs.logits
+        
+        # 使用基线计算优势函数等
+        advantage = compute_advantage(policy_outputs.logits, baseline)
+        return policy_loss, advantage
+    
+    不使用 CPU offloading：
+        GPU 显存使用:
+        - policy_model: 4GB
+        - reference_model: 4GB  
+        - 激活值: 2GB
+        总使用: 10GB
+    使用 CPU offloading：
+        GPU 显存使用:
+        - policy_model: 4GB
+        - reference_model: 0GB (在CPU上)
+        - 激活值: 2GB
+        总使用: 6GB (节省 4GB)
+    注意：
+        # 频繁在 CPU/GPU 间移动会有性能开销
+        # 适合 reference_model 使用频率不高的场景
+
+        # 好的模式：每个epoch移动几次
+        # 差的模式：每个batch都移动
+    """
+
+    #dist.barrier(device_ids=[torch.cuda.current_device()])
+    dist.barrier()
 
     ############################################
     # Initialize vLLM (Inference) engine
     ############################################
-
-    see_memory_usage("Before initializing inference engine", force=dist.get_rank() == 0)
+    see_memory_usage("Before initializing  vllm inference engine", force=dist.get_rank() == 0)
 
     if dist.get_rank() != 0:
         # Disable root vllm logger for non-main ranks
         vllm_logger = logging.getLogger("vllm")
         vllm_logger.setLevel(logging.ERROR)
 
-    inference_engine = LLM(
+    # 每个gpu上初始化一个vllm engine,作为reference model的推理引擎
+    vllm_inference_engine = LLM(
         model=MODEL_NAME,
         skip_tokenizer_init=False,
         gpu_memory_utilization=0.3,
@@ -846,11 +958,11 @@ def main(rank: int):
         tensor_parallel_size=1,
     )
     if args.algorithm == "vineppo":
-        logits_processors = [fix_oov_logits_processor(inference_engine)]
+        logits_processor_fn_list = [fix_oov_logits_processor(vllm_inference_engine)]
     else:
-        logits_processors = None
+        logits_processor_fn_list = None
 
-    see_memory_usage("After initializing inference engine", force=dist.get_rank() == 0)
+    see_memory_usage("After initializing vllm inference engine", force=dist.get_rank() == 0)
 
     # Wandb for logging. Only rank 0 will initialize wandb
     if dist.get_rank() == 0:
@@ -879,11 +991,11 @@ def main(rank: int):
     ckpt_path, ckpt_iter = find_last_checkpoint(EXP_DIR)
     if ckpt_path is not None:
         logger.info(f"Resuming from checkpoint {ckpt_path} at iteration {ckpt_iter}")
-        out = policy_model.load_checkpoint(ckpt_path / "deepspeed")
+        out = policy_model.load_checkpoint(ckpt_path / "deepspeed") # deepspeed load checkpoint
         if out is None:
             raise RuntimeError(f"Failed to load checkpoint {ckpt_path}")
         begin_iter = ckpt_iter + 1
-        load_model_into_vllm(policy_model, inference_engine)
+        load_model_into_vllm(policy_model, vllm_inference_engine)
 
         logger.info(f"Skipping {ckpt_iter} rounds of samples")
         for _ in trange(ckpt_iter, disable=dist.get_rank() != 0):
@@ -902,7 +1014,7 @@ def main(rank: int):
         if iteration % 25 == 0 and iteration > 0 and dist.get_rank() == 0:  # Only rank 0 will evaluate:
             logger.info("Evaluating on eval set...")
             eval_episodes, eval_stats = evaluate_on_test_set(
-                inference_engine=inference_engine,
+                inference_engine=vllm_inference_engine, # 现在是policy model
                 test_dataset=test_dataset,
                 tokenizer=tokenizer,
                 eos_token=EOS_TOKEN,
@@ -915,16 +1027,12 @@ def main(rank: int):
                 ),
                 reward_func=lambda completion, sample: compute_reward(completion, sample, EOS_TOKEN),
             )
-            eval_episode_table = dump_episodes(
-                episodes=eval_episodes,
-                episodes_stats=eval_stats,
-                exp_dir=EXP_DIR,
-                tokenizer=tokenizer,
-                iteration=iteration,
-                is_eval=True,
-            )
+
+            eval_episode_table = dump_episodes(episodes=eval_episodes, episodes_stats=eval_stats, exp_dir=EXP_DIR, tokenizer=tokenizer, iteration=iteration, is_eval=True,)
             wandb.log({"eval/episodes": eval_episode_table, "iteration": iteration})
-        dist.barrier(device_ids=[torch.cuda.current_device()])
+        # -------------------
+        #dist.barrier(device_ids=[torch.cuda.current_device()])
+        dist.barrier()
 
         #########################################################
         # Generate Episodes
@@ -937,7 +1045,7 @@ def main(rank: int):
         gen_time = time.time()
 
         # Rollout: Sample responses
-        outputs = inference_engine.generate(
+        outputs = vllm_inference_engine.generate(
             prompt_token_ids=samples["input_ids"],
             sampling_params=SamplingParams(
                 n=GENERATIONS_PER_SAMPLE,
@@ -947,11 +1055,13 @@ def main(rank: int):
                 max_tokens=MAX_RESPONSE_TOKENS,
                 detokenize=False,
                 stop_token_ids=[EOS_TOKEN_ID],
-                logits_processors=logits_processors,
+                logits_processors=logits_processor_fn_list,
             ),
         )
-        all_generations = [list(g.token_ids) for out in outputs for g in out.outputs]
-        all_finish_reasons = [g.finish_reason for out in outputs for g in out.outputs]
+        all_generations = [list(g.token_ids) for out in outputs
+                                                for g in out.outputs]
+        all_finish_reasons = [g.finish_reason for out in outputs
+                                                for g in out.outputs]
 
         logger.info(f"Generated {len(all_generations)} responses")
         logger.info(f"Time taken to generate {len(all_generations)} responses: {time.time() - gen_time} seconds")
@@ -968,7 +1078,7 @@ def main(rank: int):
             )
         elif args.algorithm == "vineppo":
             episodes, episodes_stats = create_vineppo_training_episodes(
-                inference_engine=inference_engine,
+                inference_engine=vllm_inference_engine,
                 samples=samples,
                 all_generations=all_generations,
                 all_finish_reasons=all_finish_reasons,
@@ -985,7 +1095,7 @@ def main(rank: int):
         else:
             raise ValueError(f"Invalid algorithm: {args.algorithm}")
 
-        inference_engine.sleep(1)
+        vllm_inference_engine.sleep(1)
         gc.collect()
         torch.cuda.empty_cache()
         time.sleep(1)
@@ -1020,21 +1130,13 @@ def main(rank: int):
 
         with torch.no_grad():
             ref_log_probs = []
-            for i in trange(
-                0,
-                EPISODES_PER_ITERATION_PER_RANK,
-                PER_DEVICE_BATCH_SIZE,
-                desc="Computing reference logprobs",
-                disable=dist.get_rank() != 0,
-            ):
+            for i in trange(0, EPISODES_PER_ITERATION_PER_RANK, PER_DEVICE_BATCH_SIZE,
+                            desc="Computing reference logprobs", disable=dist.get_rank() != 0):
                 batch = {k: v[i : i + PER_DEVICE_BATCH_SIZE] for k, v in model_inputs.items()}
-                ref_log_probs.append(
-                    compute_token_log_probs(
-                        model=reference_model,
-                        inputs=batch,
-                        temperature=TEMPERATURE,
-                    )
-                )
+                # ref_token_log_probs:[batch_size, seq_len-1]
+                ref_token_log_probs = compute_token_log_probs(model=reference_model, inputs=batch, temperature=TEMPERATURE)
+                ref_log_probs.append(ref_token_log_probs)
+
             ref_log_probs = torch.cat(ref_log_probs)
             model_inputs["ref_log_probs"] = ref_log_probs
             del ref_log_probs
@@ -1051,23 +1153,12 @@ def main(rank: int):
         total_response_len = (model_inputs["labels"] != -100).sum()
         train_time = time.time()
 
-        for i in trange(
-            0,
-            EPISODES_PER_ITERATION_PER_RANK,
-            PER_DEVICE_BATCH_SIZE,
-            desc="Gradient Accumulation",
-            disable=dist.get_rank() != 0,
-        ):
+        for i in trange(0, EPISODES_PER_ITERATION_PER_RANK, step=PER_DEVICE_BATCH_SIZE,
+                        desc="Gradient Accumulation", disable=dist.get_rank() != 0):
             batch = {k: v[i : i + PER_DEVICE_BATCH_SIZE] for k, v in model_inputs.items()}
 
             # Compute policy gradient loss
-            loss, loss_metrics = compute_pg_loss(
-                policy_model=policy_model,
-                batch=batch,
-                total_response_len=total_response_len,
-                TEMPERATURE=TEMPERATURE,
-                KL_COEFFICIENT=KL_COEFFICIENT,
-            )
+            loss, loss_metrics = compute_pg_loss(policy_model=policy_model, batch=batch, total_response_len=total_response_len, TEMPERATURE=TEMPERATURE, KL_COEFFICIENT=KL_COEFFICIENT, )
 
             # Track metrics
             metrics.setdefault("loss", []).append(loss.item())
@@ -1095,8 +1186,8 @@ def main(rank: int):
         torch.cuda.empty_cache()
         time.sleep(1)
 
-        inference_engine.wake_up()
-        load_model_into_vllm(policy_model, inference_engine) # 更新vllm中的模型权重
+        vllm_inference_engine.wake_up()
+        load_model_into_vllm(policy_model, vllm_inference_engine) # 更新vllm中的模型权重
 
         #########################################################
         # Log metrics
@@ -1130,21 +1221,19 @@ def main(rank: int):
         if iteration % 50 == 0 and iteration != 0:
             ckpt_dir = EXP_DIR / "checkpoints" / f"ckpt_{iteration:06d}"
 
-            logger.info("Saving HF model")
             if dist.get_rank() == 0:
+                logger.info("Saving HF model")
                 policy_model.module.save_pretrained(str(ckpt_dir / "hf_model"))
                 tokenizer.save_pretrained(str(ckpt_dir / "hf_model"))
+
             dist.barrier(device_ids=[torch.cuda.current_device()])
 
+            # 所有的rank均需要存储deepspeed模型
             logger.info("Saving DeepSpeed checkpoint")
             policy_model.save_checkpoint(str(ckpt_dir / "deepspeed"))
 
             if dist.get_rank() == 0:
-                clean_up_checkpoints(
-                    exp_dir=EXP_DIR,
-                    keep_every_n_steps=50,
-                    exclude=[ckpt_dir],
-                )
+                clean_up_checkpoints( exp_dir=EXP_DIR, keep_every_n_steps=50, exclude=[ckpt_dir], )
             dist.barrier(device_ids=[torch.cuda.current_device()])
 
     dist.destroy_process_group()

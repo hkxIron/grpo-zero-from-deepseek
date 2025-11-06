@@ -1168,7 +1168,4 @@ if __name__ == "__main__":
 Here is the command to run the training script with 4 GPUs:
 
 python nano_r1_script.py --nproc 4  # Use 4 GPUs
-
-python nano_r1_script.py --nproc 1
-
 """

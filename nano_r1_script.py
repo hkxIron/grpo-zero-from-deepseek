@@ -312,7 +312,8 @@ def create_vineppo_training_episodes(
 
     This function implements the VinePPO algorithm,
     which uses Monte Carlo rollouts to estimate state values and compute token-level advantages.
-    See: https://arxiv.org/abs/2410.01679
+    See: https://arxiv.org/abs/2410.01679, VinePPO: Refining Credit Assignment in RL Training of LLMs
+
 
     Note that it only differs from GRPO in the way it computes advantages. So the rest of the code stays the same.
 

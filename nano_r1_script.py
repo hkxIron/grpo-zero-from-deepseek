@@ -644,6 +644,7 @@ def compute_pg_loss(
     policy_loss = -logps_per_token * advantages[..., 1:]  # [batch_size, seq_len-1]
     policy_loss = policy_loss * labels_mask  # [batch_size, seq_len-1]
 
+    # negative log loss + kl penalty
     loss = (policy_loss + KL_COEFFICIENT * kl_penalty).sum() / total_response_len  # scalar
 
     metrics = {

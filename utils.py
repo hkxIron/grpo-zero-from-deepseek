@@ -36,12 +36,7 @@ def create_prompt(
     return tokenizer.apply_chat_template(prefix, tokenize=False, continue_final_message=True)
 
 
-def prepare_model_inputs(
-    query_token_ids: List[List[int]],
-    response_token_ids: List[List[int]],
-    advantages: List[List[float]],
-    device: torch.device,
-) -> Dict[str, torch.Tensor]:
+def prepare_model_inputs(query_token_ids: List[List[int]], response_token_ids: List[List[int]], advantages: List[List[float]], device: torch.device, ) -> Dict[str, torch.Tensor]:
     """
     Prepare padded model inputs with attention masks, labels, and advantages.
     Args:
@@ -61,7 +56,7 @@ def prepare_model_inputs(
         {
             'input_ids': tensor([
                 [1, 2, 3, 6, 7],
-                [4, 5, 8, 0, 0]
+                [4, 5, 8, 0, 0] # 右边padding
             ]),
             'attention_mask': tensor([
                 [1, 1, 1, 1, 1],
@@ -88,11 +83,12 @@ def prepare_model_inputs(
         seq_len = len(combined_ids)
 
         # Create padded sequences
-        input_ids = combined_ids + [pad_token_id] * (max_seq_len - seq_len)
+        input_ids = combined_ids + [pad_token_id] * (max_seq_len - seq_len) # TODO: 不应该是左边的padding吗？不明白为何此处是右边的padding
         attention_mask = [1] * seq_len + [0] * (max_seq_len - seq_len)
+        # Create labels, masking -100 positions
         labels = [ignore_index] * len(query) + response + [ignore_index] * (max_seq_len - seq_len)
         labels_mask = [0] * len(query) + [1] * len(response) + [0] * (max_seq_len - seq_len)
-        advantages_seq = [0.0] * len(query) + advantage + [0.0] * (max_seq_len - seq_len)
+        advantages_seq = [0.0] * len(query) + advantage + [0.0] * (max_seq_len - seq_len) # 注意：此处是右padding
 
         assert len(input_ids) == max_seq_len
         assert len(attention_mask) == max_seq_len
@@ -105,11 +101,12 @@ def prepare_model_inputs(
         inputs["labels"].append(labels)
         inputs["advantages"].append(advantages_seq)
         inputs["labels_mask"].append(labels_mask)
+    # -----------------
 
     # Convert to tensors
     return {
         k: torch.tensor(v, dtype=torch.long if k != "advantages" else torch.float, device=device)
-        for k, v in inputs.items()
+           for k, v in inputs.items()
     }
 
 
@@ -120,7 +117,7 @@ def log_softmax_and_gather(logits: torch.Tensor, index: torch.Tensor) -> torch.T
 
     torch compiled version of the common `log_softmax -> gather` operation.
 
-    The compiled version of this opration avoids the (significant) memory overhead of
+    The compiled version of this operation avoids the (significant) memory overhead of
     allocating a new (batch_size, seq_len, vocab_size) tensor to store the logprobs.
 
     Args:
@@ -178,6 +175,8 @@ def compute_token_log_probs(
         torch.Size([1, 2])  # batch_size=1, seq_len-1=2
         >>> # First position is 0 (masked), second position has actual log prob
     """
+
+    # NOTE: 注意， reference_model的推理并没有用到vllm, 因为需要用到attention_mask, 而vllm面向文本的，不支持attention_mask
     outputs = model(
         input_ids=inputs["input_ids"],
         attention_mask=inputs["attention_mask"],
@@ -251,6 +250,7 @@ def evaluate_on_test_set(
         ... )
         >>> print(f"Average reward: {episodes_stats['rewards']:.3f}")
     """
+
     generations = inference_engine.generate(
         prompt_token_ids=test_dataset["input_ids"], sampling_params=eval_sampling_params
     )
@@ -270,6 +270,7 @@ def evaluate_on_test_set(
         finish_reason = generations[i].outputs[0].finish_reason
 
         response = tokenizer.decode(response_token_ids, skip_special_tokens=False)
+        # 返回reward + reward_metrics, metric: format_reward, equation_reward
         reward, reward_components = reward_func(response, sample)
 
         all_query_token_ids.append(query_token_ids)
@@ -288,7 +289,6 @@ def evaluate_on_test_set(
 
     return episodes, metrics
 
-
 def dump_episodes(
     episodes: Dict[str, Any],
     episodes_stats: Dict[str, Any],
@@ -303,14 +303,8 @@ def dump_episodes(
     rewards = episodes_stats["rewards"]
     response_lengths = episodes_stats["response_lengths"]
 
-    query_texts = tokenizer.batch_decode(
-        query_token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
-    )
-    response_texts = tokenizer.batch_decode(
-        response_token_ids,
-        skip_special_tokens=False,
-        clean_up_tokenization_spaces=False,
-    )
+    query_texts = tokenizer.batch_decode(query_token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False )
+    response_texts = tokenizer.batch_decode( response_token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False, )
 
     if dist.is_initialized():
         rank = dist.get_rank()
@@ -330,11 +324,13 @@ def dump_episodes(
         episodes_dir = exp_dir / "eval_episodes"
     else:
         episodes_dir = exp_dir / "episodes"
-    if dist.is_initialized():
+
+    if dist.is_initialized(): # 每个rank保存到自己的目录
         episodes_dir = episodes_dir / f"rank_{rank:02d}"
+    # -----------------------------------
     episodes_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create wandb table
+    # Create wandb table, 可用用于显示文本
     table = wandb.Table(columns=["query", "response", "reward", "response_length"])
     for i in range(len(query_texts)):
         table.add_data(query_texts[i], response_texts[i], rewards[i], response_lengths[i])
@@ -342,6 +338,7 @@ def dump_episodes(
     if not do_save:
         return table
 
+    # 将每个episode结果保存为json文件
     with open(episodes_dir / f"eps_{iteration:06d}.json", "w") as f:
         json.dump(
             [
@@ -506,6 +503,7 @@ def fix_oov_logits_processor(inference_engine: LLM):
     tokenizer_vocab_size = len(inference_engine.get_tokenizer().get_vocab())
 
     def fix_oov(token_ids, logits):
+        # 将所有大于 tokenizer_vocab_size 的 token id 的 logits 设置为 -inf
         logits[tokenizer_vocab_size:] = -float("inf")
         return logits
 

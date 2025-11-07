@@ -60,7 +60,7 @@ def prepare_model_inputs(query_token_ids: List[List[int]], response_token_ids: L
             ]),
             'attention_mask': tensor([
                 [1, 1, 1, 1, 1],
-                [1, 1, 1, 0, 0]
+                [1, 1, 1, 0, 0] # 右边padding
             ]),
             'labels': tensor([
                 [-100, -100, -100, 6, 7],
@@ -176,8 +176,8 @@ def compute_token_log_probs(
         >>> # First position is 0 (masked), second position has actual log prob
     """
 
-    # NOTE: 注意， reference_model的推理并没有用到vllm, 因为需要用到attention_mask, 而vllm面向文本的，不支持attention_mask
-    outputs = model(
+    # NOTE: 注意， reference_model的推理并没有用到vllm, 因为需要用到attention_mask, 而vllm面向文本输入的，而不是token_ids，本身并不支持attention_mask,所以不需要vllm
+    outputs = model.forward(
         input_ids=inputs["input_ids"],
         attention_mask=inputs["attention_mask"],
         return_dict=True,
@@ -366,7 +366,7 @@ def find_last_checkpoint(exp_dir: Path) -> Tuple[Optional[Path], Optional[int]]:
     ckpt_iter = int(ckpt_path.stem.split("_")[-1])
     return ckpt_path, ckpt_iter
 
-
+# 将模型加载到vllm inference engine
 def load_model_into_vllm(model: Union[DeepSpeedEngine, PreTrainedModel], vllm_engine: LLM) -> None:
     """
     Load weights from a HuggingFace model (either wrapped in DeepSpeed or not) into a vLLM inference engine.

@@ -14,6 +14,7 @@ import torch.distributed as dist
 from datasets import load_dataset
 from deepspeed import DeepSpeedEngine
 from deepspeed.runtime.utils import see_memory_usage
+from torch.distributions import kl_divergence
 from tqdm import trange
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 from vllm import LLM, CompletionOutput, RequestOutput, SamplingParams
@@ -57,6 +58,19 @@ arg_parser.add_argument("--run_id", type=str, default=None, help="Run ID")
 arg_parser.add_argument("--nproc", type=int, default=1, help="Number of processes (data parallelism) to use")
 arg_parser.add_argument("--data_path", type=str, default="Jiayi-Pan/Countdown-Tasks-3to4", help="数据集路径")
 
+"""
+如果不使用apply_chat_template，qwen tokenizer也可以用如下的方式生成聊天模板
+"""
+def generate_prompt_text(system_prompt, user_prompt):
+    from jinja2 import Template
+    prompt_template = Template("""<|im_start|>system
+    {{ system_prompt }}<|im_end|>
+    <|im_start|>user
+    {{ user_prompt }}<|im_end|>
+    <|im_start|>assistant
+    """)
+    prompt = prompt_template.render(system_prompt=system_prompt, user_prompt=user_prompt)
+    return prompt
 
 # Load and process dataset
 def preprocess_example(
@@ -185,14 +199,16 @@ def compute_reward(completion: str, sample: Dict[str, Any], EOS_TOKEN: str) -> T
     reward = format_reward + equation_reward
 
     metrics = {
+        # 格式校验
         "format_reward": format_reward,
+        # 结果校验
         "equation_reward": equation_reward,
     }
 
     return reward, metrics
 
 
-def create_training_episodes(
+def create_grpo_training_episodes(
     *,
     samples: List[Dict[str, Any]] = None,
     all_generations: List[List[int]] = None,
@@ -212,7 +228,7 @@ def create_training_episodes(
     Args:
         samples: List of input samples, each containing:
             - input_ids: List[int], tokenized input prompt
-            - nums: List[int], numbers to use in equation
+            - nums: List[int], numbers to use in equation, 使用的数字的个数
             - target: int, target value for equation
         all_generations: List of token ID sequences for each generated response
         all_finish_reasons: List of finish reasons for each generation ("stop" or other)
@@ -233,7 +249,7 @@ def create_training_episodes(
         >>> samples = [{"input_ids": [1,2,3], "nums": [1,2,3], "target": 6}]
         >>> generations = [[4,5], [6,7], [8,9]]  # 3 generations per sample
         >>> finish_reasons = ["stop", "length", "stop"]
-        >>> episodes, stats = create_training_episodes(samples, generations, finish_reasons)
+        >>> episodes, stats = create_grpo_training_episodes(samples, generations, finish_reasons)
         >>> episodes
         {
             'all_query_token_ids': [[1,2,3], [1,2,3], [1,2,3]],
@@ -267,6 +283,7 @@ def create_training_episodes(
         rewards = np.array(rewards)
         advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
 
+        # NOTE: 注意，这里同一个seq中每个token的advantage都是一样的
         # per_token_advantages = [resp_length], 注意：此处是每一token都复制了一个advantage, 但感觉不是非常必要
         per_token_advantages = [[adv] * len(resp) for adv, resp in zip(advantages, response_token_ids)]
 
@@ -356,7 +373,7 @@ def create_vineppo_training_episodes(
 
         return step_boundaries
 
-    def estimate_values_by_mc_rollouts(episodes_raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def estimate_values_by_monte_carlo_rollouts(episodes_raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         def get_response_prefixes(
             response_token_ids: List[int], states_for_value_estimation: List[int]
         ) -> List[List[int]]:
@@ -365,7 +382,7 @@ def create_vineppo_training_episodes(
                 prefixes.append(response_token_ids[:state])
             return prefixes
 
-        def get_mc_queries(
+        def get_monte_carlo_queries(
             query_token_ids: List[int], response_prefixes_token_ids: List[List[int]]
         ) -> Tuple[List[List[int]], List[int]]:
             prefix_queries_token_ids = []
@@ -418,7 +435,7 @@ def create_vineppo_training_episodes(
             eps["mc_response_prefixes_token_ids"] = get_response_prefixes(eps["response_token_ids"], eps["new_states"])
 
             # Get MC queries where we just add the query to each prefix
-            eps["mc_queries_token_ids"], eps["mc_queries_max_tokens"] = get_mc_queries(
+            eps["mc_queries_token_ids"], eps["mc_queries_max_tokens"] = get_monte_carlo_queries(
                 eps["query_token_ids"], eps["mc_response_prefixes_token_ids"]
             )
 
@@ -550,7 +567,7 @@ def create_vineppo_training_episodes(
         }
         raw_episodes.append(eps)
 
-    raw_episodes = estimate_values_by_mc_rollouts(raw_episodes)
+    raw_episodes = estimate_values_by_monte_carlo_rollouts(raw_episodes)
 
     all_advantages = []
     for eps in raw_episodes:
@@ -565,7 +582,7 @@ def create_vineppo_training_episodes(
     return episodes, stats
 
 
-def compute_pg_loss(
+def compute_policy_gradient_loss(
     policy_model: Union[DeepSpeedEngine, PreTrainedModel],
     batch: Dict[str, torch.Tensor],
     total_response_len: torch.Tensor,
@@ -603,7 +620,7 @@ def compute_pg_loss(
     labels = batch["labels"]  # [batch_size, seq_len]
     labels_mask = batch["labels_mask"]  # [batch_size, seq_len]
     advantages = batch["advantages"]  # [batch_size, seq_len]
-    ref_logps = batch["ref_log_probs"]  # [batch_size, seq_len-1]
+    ref_logps_per_token = batch["ref_log_probs"]  # [batch_size, seq_len-1]
 
     model_inputs = {
         "input_ids": input_ids,
@@ -616,9 +633,10 @@ def compute_pg_loss(
     labels_mask = labels_mask[..., 1:].to(logps_per_token.dtype)  # [batch_size, seq_len-1]
 
     """
+    正向KL
     kl_div(p, q) = p*log(p/q) = plog(p) - plog(q)
     = (-plog(q)) - (- plog(p))
-    = ross_entropy(p, q) - entropy(p)
+    = cross_entropy(p, q) - entropy(p)
     =>
     实际如下计算，但我并不清楚其中原理
     kl_div(p, q) = q/p - log(q) - 1
@@ -630,17 +648,29 @@ def compute_pg_loss(
         rewards = non_score_reward.copy()
         rewards[:, -1] += scores
         return rewards, non_score_reward, self.kl_ctl.value
+        
+    正向KL
+    KL(P||Q) = sum_{pi} (pi*log(pi/qi)), pi为真实分布，qi为模型分布
+        
+    反向KL
+    KL(Q||P) = sum_{qi} (qi*log(qi/pi)), pi为真实分布，qi为模型分布
     """
-    # ref_logprobs，只为了计算kl散度
-    ref_logratio = ref_logps - logps_per_token
-    kl_penalty = torch.exp(ref_logratio) - 1 - ref_logratio  # [batch_size, seq_len-1], NOTE: 这里为何要多减一个ref_logratio,感觉没有必要吧？
-    kl_penalty = kl_penalty * labels_mask  # [batch_size, seq_len-1]
+    # kl_divergence_loss: 只为了计算正向kl散度
+    kl_divergence_loss = ref_logps_per_token - logps_per_token
+    #ref_prob_ratio = torch.exp(kl_divergence_loss) # 注意：这里并不是 重要性采样
+    #kl_penalty = ref_prob_ratio - 1 - kl_divergence_loss  # [batch_size, seq_len-1], NOTE: 这里为何要多减一个ref_logratio,感觉没有必要吧？我暂时先去掉
+    #kl_penalty = kl_penalty * labels_mask  # [batch_size, seq_len-1]
+    kl_penalty = kl_divergence_loss * labels_mask  # [batch_size, seq_len-1]
 
     with torch.no_grad():
         # logps_per_token: [batch_size, seq_len-1]
-        entropy = -logps_per_token.sum() / labels_mask.sum()  # scalar,这个batch中所有的token概率求和, NOTE:感觉是少乘了p吧 ，熵应该是 -p*log(p)
-        zero_advantages = close_to_zero(advantages, labels_mask)  # scalar
+        entropy = -logps_per_token.sum() / labels_mask.sum()  # scalar,这个batch中所有的token概率求和, NOTE:这里并没有少乘p，熵公式 -p*log(p)，但是logs_per_token本身就是选择的token的概率
+        zero_advantages = close_to_zero(advantages[..., 1:], labels_mask)  # scalar
 
+    """
+    标准的原始policy gradient公式
+    gradient( log(pai(a_{i,j}[t])) * Adv_{i,j}[t] )
+    """
     # advantage为loss的权重，最后的loss为加权loss
     policy_loss = -logps_per_token * advantages[..., 1:]  # [batch_size, seq_len-1]
     policy_loss = policy_loss * labels_mask  # [batch_size, seq_len-1]
@@ -906,10 +936,10 @@ def main(rank: int):
             reference_model.module.cuda()
             reference_outputs = reference_model.module(**batch)
             reference_model.module.cpu()  # 计算完立即移回CPU
-            baseline = reference_outputs.logits
+            baseline_logits = reference_outputs.logits
         
         # 使用基线计算优势函数等
-        advantage = compute_advantage(policy_outputs.logits, baseline)
+        advantage = compute_advantage(policy_outputs.logits, baseline_logits)
         return policy_loss, advantage
     
     不使用 CPU offloading：
@@ -946,7 +976,7 @@ def main(rank: int):
         vllm_logger.setLevel(logging.ERROR)
 
     # 每个gpu上初始化一个vllm engine,作为reference model的推理引擎
-    vllm_inference_engine = LLM(
+    vllm_engine = LLM(
         model=MODEL_NAME,
         skip_tokenizer_init=False,
         gpu_memory_utilization=0.3,
@@ -960,7 +990,7 @@ def main(rank: int):
         tensor_parallel_size=1,
     )
     if args.algorithm == "vineppo":
-        logits_processor_fn_list = [fix_oov_logits_processor(vllm_inference_engine)]
+        logits_processor_fn_list = [fix_oov_logits_processor(vllm_engine)]
     else:
         logits_processor_fn_list = None
 
@@ -968,8 +998,9 @@ def main(rank: int):
 
     # Wandb for logging. Only rank 0 will initialize wandb
     if dist.get_rank() == 0:
+        wandb.login()
         wandb.init(
-            project="nano-aha-moment",
+            project="grpo-zero-from-deepseek",
             name=RUN_NAME,
             resume="allow",
             config={
@@ -996,13 +1027,38 @@ def main(rank: int):
         out = policy_model.load_checkpoint(ckpt_path / "deepspeed") # deepspeed load checkpoint
         if out is None:
             raise RuntimeError(f"Failed to load checkpoint {ckpt_path}")
+        # 设置begin_iter = ckpt_iter + 1：从上次训练的下一个迭代开始
         begin_iter = ckpt_iter + 1
-        load_model_into_vllm(policy_model, vllm_inference_engine)
+        # 模型加载到vllm engine中
+        load_model_into_vllm(policy_model, vllm_engine)
 
+        """
+        用户看到：只有主进程显示一个进度条，显示"跳过"的采样轮次
+        系统内部：所有进程都在同步推进各自的随机数生成器
+        最终结果：从检查点恢复后，所有进程的随机状态与训练中断前完全一致
+        
+        
+        len(train_dataset)：选择范围，从 0 到数据集大小-1
+        size=NUM_SAMPLES_PER_ITERATION：每次迭代采样的样本数量
+        replace=False：无放回抽样，确保不会重复选择相同的样本
+       
+        在正常训练中：
+        # 每次迭代会这样采样数据
+        indices = sampler_rng.choice(len(train_dataset), size=NUM_SAMPLES_PER_ITERATION, replace=False)
+        batch_data = [train_dataset[i] for i in indices]  # 使用采样结果 
+        
+        在恢复训练时：
+        # 只是推进随机状态，不实际使用采样结果
+        _ = sampler_rng.choice(len(train_dataset), size=NUM_SAMPLES_PER_ITERATION, replace=False)
+        """
+        # 为了保持随机数生成器的状态一致性，代码模拟了之前已经进行过的数据采样轮次。
+        # 在恢复训练时，同步所有进程的随机数生成器状态
         logger.info(f"Skipping {ckpt_iter} rounds of samples")
-        for _ in trange(ckpt_iter, disable=dist.get_rank() != 0):
+        for _ in trange(ckpt_iter, disable=dist.get_rank() != 0): # rank=0 主进程显示进度条
+            # 每次调用 sampler_rng.choice：推进随机数生成器的状态
             _ = sampler_rng.choice(len(train_dataset), size=NUM_SAMPLES_PER_ITERATION, replace=False)
 
+    # 从ckpt恢得后继续训练
     for iteration in trange(begin_iter, NUM_ITERATIONS):
         logger.info(f"Iteration {iteration}/{NUM_ITERATIONS}")
 
@@ -1016,7 +1072,7 @@ def main(rank: int):
         if iteration % 25 == 0 and iteration > 0 and dist.get_rank() == 0:  # Only rank 0 will evaluate:
             logger.info("Evaluating on eval set...")
             eval_episodes, eval_stats = evaluate_on_test_set(
-                inference_engine=vllm_inference_engine, # 现在是policy model
+                inference_engine=vllm_engine, # 现在是policy model
                 test_dataset=test_dataset,
                 tokenizer=tokenizer,
                 eos_token=EOS_TOKEN,
@@ -1030,6 +1086,7 @@ def main(rank: int):
                 reward_func=lambda completion, sample: compute_reward(completion, sample, EOS_TOKEN),
             )
 
+            # 将每个episode结果保存为json文件
             eval_episode_table = dump_episodes(episodes=eval_episodes, episodes_stats=eval_stats, exp_dir=EXP_DIR, tokenizer=tokenizer, iteration=iteration, is_eval=True,)
             wandb.log({"eval/episodes": eval_episode_table, "iteration": iteration})
         # -------------------
@@ -1047,7 +1104,7 @@ def main(rank: int):
         gen_time = time.time()
 
         # Rollout: Sample responses
-        outputs = vllm_inference_engine.generate(
+        rollout_trajectories = vllm_engine.generate(
             prompt_token_ids=samples["input_ids"],
             sampling_params=SamplingParams(
                 n=GENERATIONS_PER_SAMPLE,
@@ -1060,9 +1117,9 @@ def main(rank: int):
                 logits_processors=logits_processor_fn_list,
             ),
         )
-        all_generations = [list(g.token_ids) for out in outputs
+        all_generations = [list(g.token_ids) for out in rollout_trajectories
                                                 for g in out.outputs]
-        all_finish_reasons = [g.finish_reason for out in outputs
+        all_finish_reasons = [g.finish_reason for out in rollout_trajectories
                                                 for g in out.outputs]
 
         logger.info(f"Generated {len(all_generations)} responses")
@@ -1070,7 +1127,7 @@ def main(rank: int):
 
         # Process responses and calculate rewards
         if args.algorithm == "grpo":
-            episodes, episodes_stats = create_training_episodes(
+            episodes, episodes_stats = create_grpo_training_episodes(
                 samples=samples,
                 all_generations=all_generations,
                 all_finish_reasons=all_finish_reasons,
@@ -1080,7 +1137,7 @@ def main(rank: int):
             )
         elif args.algorithm == "vineppo":
             episodes, episodes_stats = create_vineppo_training_episodes(
-                inference_engine=vllm_inference_engine,
+                inference_engine=vllm_engine,
                 samples=samples,
                 all_generations=all_generations,
                 all_finish_reasons=all_finish_reasons,
@@ -1097,7 +1154,7 @@ def main(rank: int):
         else:
             raise ValueError(f"Invalid algorithm: {args.algorithm}")
 
-        vllm_inference_engine.sleep(1)
+        vllm_engine.sleep(1)
         gc.collect()
         torch.cuda.empty_cache()
         time.sleep(1)
@@ -1105,7 +1162,7 @@ def main(rank: int):
         for k, v in episodes_stats.items():
             metrics.setdefault(k, []).extend(v)
 
-        episode_table = dump_episodes(
+        episode_table:wandb.Table = dump_episodes(
             episodes=episodes,
             episodes_stats=episodes_stats,
             exp_dir=EXP_DIR,
@@ -1126,7 +1183,7 @@ def main(rank: int):
             device=curr_cuda_device,
         )
 
-        logger.info("Moving reference model to GPU")
+        logger.info(f"rank={dist.get_rank()} Moving reference model to GPU")
         reference_model.module.to(curr_cuda_device)
         reference_model.eval()
 
@@ -1144,23 +1201,23 @@ def main(rank: int):
             del ref_log_probs
 
         # Free memory taken by reference model
-        logger.info("Moving reference model back to CPU")
-        reference_model.cpu() # 将model 移到cpu
+        logger.info(f"rank={dist.get_rank()} Moving reference model back to CPU")
+        reference_model.cpu() # 将ds model 移到cpu
         gc.collect()
         torch.cuda.empty_cache()
         time.sleep(1)
 
         # Calculate losses and update model
-        policy_model.train()
+        policy_model.train() # policy_model为 DeepSpeedEngine
         total_response_len = (model_inputs["labels"] != -100).sum()
         train_time = time.time()
 
-        for i in trange(0, EPISODES_PER_ITERATION_PER_RANK, step=PER_DEVICE_BATCH_SIZE,
+        for i in trange(0, EPISODES_PER_ITERATION_PER_RANK, PER_DEVICE_BATCH_SIZE,
                         desc="Gradient Accumulation", disable=dist.get_rank() != 0):
             batch = {k: v[i : i + PER_DEVICE_BATCH_SIZE] for k, v in model_inputs.items()}
 
             # Compute policy gradient loss
-            loss, loss_metrics = compute_pg_loss(policy_model=policy_model, batch=batch, total_response_len=total_response_len, TEMPERATURE=TEMPERATURE, KL_COEFFICIENT=KL_COEFFICIENT, )
+            loss, loss_metrics = compute_policy_gradient_loss(policy_model=policy_model, batch=batch, total_response_len=total_response_len, TEMPERATURE=TEMPERATURE, KL_COEFFICIENT=KL_COEFFICIENT, )
 
             # Track metrics
             metrics.setdefault("loss", []).append(loss.item())
@@ -1188,8 +1245,8 @@ def main(rank: int):
         torch.cuda.empty_cache()
         time.sleep(1)
 
-        vllm_inference_engine.wake_up()
-        load_model_into_vllm(policy_model, vllm_inference_engine) # 更新vllm中的模型权重
+        vllm_engine.wake_up()
+        load_model_into_vllm(policy_model, vllm_engine) # 将policy的权重更新vllm中的模型
 
         #########################################################
         # Log metrics
@@ -1200,7 +1257,7 @@ def main(rank: int):
             train_metrics["learning_rate"] = policy_model.get_lr()[0]
             logs = {
                 "iteration": iteration,
-                f"episodes/iter_{iteration:06d}": episode_table,
+                f"episodes/iter_{iteration:06d}": episode_table, # 将wandbTable导出到wandb网站上去
                 **{f"train/{k}": v for k, v in train_metrics.items()},
             }
             if eval_stats is not None:
@@ -1261,5 +1318,4 @@ Here is the command to run the training script with 4 GPUs:
 python nano_r1_script.py --nproc 4  # Use 4 GPUs
 
 python nano_r1_script.py --nproc 1
-
 """

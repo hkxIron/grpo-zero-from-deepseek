@@ -435,9 +435,7 @@ def create_vineppo_training_episodes(
             eps["mc_response_prefixes_token_ids"] = get_response_prefixes(eps["response_token_ids"], eps["new_states"])
 
             # Get MC queries where we just add the query to each prefix
-            eps["mc_queries_token_ids"], eps["mc_queries_max_tokens"] = get_monte_carlo_queries(
-                eps["query_token_ids"], eps["mc_response_prefixes_token_ids"]
-            )
+            eps["mc_queries_token_ids"], eps["mc_queries_max_tokens"] = get_monte_carlo_queries(eps["query_token_ids"], eps["mc_response_prefixes_token_ids"])
 
         # Flatten the MC queries to a single list which will be used for inference
         flatten_mc_queries = []
@@ -643,10 +641,10 @@ def compute_policy_gradient_loss(
     
     # openai lm_human_preferences中的kl实现：https://github.com/openai/lm-human-preferences/blob/cbfd210bb8b08f6bc5c26878c10984b90f516c66/lm_human_preferences/train_policy.py#L150-L153 
     def compute_rewards(scores, logprobs, ref_logprobs):
-        kl = logprobs - ref_logprobs # 就是标准的 p*log(p/q)
+        kl = logprobs - ref_logprobs # 就是标准的正向KL = p*log(p/q)
         non_score_reward = -self.kl_ctl.value * kl
         rewards = non_score_reward.copy()
-        rewards[:, -1] += scores
+        rewards[:, -1] += scores # 只有最后一个token有score
         return rewards, non_score_reward, self.kl_ctl.value
         
     正向KL
@@ -664,7 +662,7 @@ def compute_policy_gradient_loss(
 
     with torch.no_grad():
         # logps_per_token: [batch_size, seq_len-1]
-        entropy = -logps_per_token.sum() / labels_mask.sum()  # scalar,这个batch中所有的token概率求和, NOTE:这里并没有少乘p，熵公式 -p*log(p)，但是logs_per_token本身就是选择的token的概率
+        entropy = -logps_per_token.sum() / labels_mask.sum()  # scalar,这个batch中所有的token概率求和, NOTE:这里并没有少乘p，熵公式 -p*log(p)，logs_per_token本身就是选择的token的概率
         zero_advantages = close_to_zero(advantages[..., 1:], labels_mask)  # scalar
 
     """
@@ -975,7 +973,7 @@ def main(rank: int):
         vllm_logger = logging.getLogger("vllm")
         vllm_logger.setLevel(logging.ERROR)
 
-    # 每个gpu上初始化一个vllm engine,作为reference model的推理引擎
+    # NOTE:每个gpu上初始化一个vllm engine,作为reference model的推理引擎
     vllm_engine = LLM(
         model=MODEL_NAME,
         skip_tokenizer_init=False,
@@ -1036,7 +1034,6 @@ def main(rank: int):
         用户看到：只有主进程显示一个进度条，显示"跳过"的采样轮次
         系统内部：所有进程都在同步推进各自的随机数生成器
         最终结果：从检查点恢复后，所有进程的随机状态与训练中断前完全一致
-        
         
         len(train_dataset)：选择范围，从 0 到数据集大小-1
         size=NUM_SAMPLES_PER_ITERATION：每次迭代采样的样本数量

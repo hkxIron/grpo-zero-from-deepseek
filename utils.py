@@ -384,6 +384,7 @@ def load_model_into_vllm(model: Union[DeepSpeedEngine, PreTrainedModel], vllm_en
         None
     """
     state_dict = model.module.state_dict() if isinstance(model, DeepSpeedEngine) else model.state_dict()
+    # vllm engine加载模型权重
     vllm_engine.llm_engine.model_executor.driver_worker.model_runner.model.load_weights(state_dict.items())
 
 
